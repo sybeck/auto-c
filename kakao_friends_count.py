@@ -12,6 +12,11 @@ from google.oauth2.service_account import Credentials
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
 # =======================
 # ✅ 설정 (여기만 수정)
 # =======================
