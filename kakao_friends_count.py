@@ -2,6 +2,10 @@ import re
 import time
 from datetime import datetime
 from typing import Optional, List, Tuple, Dict
+import os
+import json
+import requests
+
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -38,6 +42,34 @@ def normalize_korean_number(text: str) -> Optional[int]:
         return int(float(m.group(1)) * 10000)
     m2 = re.search(r"(\d+)", text)
     return int(m2.group(1)) if m2 else None
+
+def fmt(n: int) -> str:
+    """
+    숫자를 천 단위 쉼표 문자열로 변환
+    """
+    return f"{n:,}"
+
+def send_to_slack(message: str):
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    if not webhook_url:
+        print("[WARN] SLACK_WEBHOOK_URL 환경변수가 없어 Slack 전송 생략")
+        return
+
+    payload = {
+        "text": message
+    }
+
+    try:
+        r = requests.post(
+            webhook_url,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=10
+        )
+        if r.status_code != 200:
+            print(f"[WARN] Slack 전송 실패: {r.status_code} {r.text}")
+    except Exception as e:
+        print(f"[WARN] Slack 전송 중 예외 발생: {e}")
 
 
 def extract_friend_count_from_html(html: str) -> Optional[int]:
@@ -228,14 +260,41 @@ def main():
     print("\n========== [TOP 10] 증가량(Δ) ==========")
     for i, (delta, name, col_idx, prev_val, curr) in enumerate(top_deltas, start=1):
         sign = "+" if delta >= 0 else ""
-        print(f"{i:02d}. {name}  {prev_val} -> {curr}  (Δ {sign}{delta})")
+        print(f"{i:02d}. {name}  "f"{fmt(prev_val)} → {fmt(curr)}  "f"(Δ {sign}{fmt(delta)})")
+
 
     print("\n========== [TOP 10] 증가율(Δ/이전) ==========")
     for i, (rate, name, col_idx, prev_val, curr, delta) in enumerate(top_rates, start=1):
         sign = "+" if delta >= 0 else ""
-        print(f"{i:02d}. {name}  {prev_val} -> {curr}  (Δ {sign}{delta}, {rate*100:.2f}%)")
+        print(f"{i:02d}. {name}  "f"{fmt(prev_val)} → {fmt(curr)}  "f"(Δ {sign}{fmt(delta)}, {rate*100:.2f}%)")
+
 
     print("\n[RANK] 출력 완료 (cron.log에 누적됩니다)")
+    lines = []
+    lines.append(f"*📈 카카오 채널 친구수 증가 리포트* ({today_str})")
+    lines.append("")
+
+    lines.append("*[TOP 10] 증가량*")
+    for i, (delta, name, col_idx, prev_val, curr) in enumerate(top_deltas, start=1):
+        sign = "+" if delta >= 0 else ""
+        lines.append(
+            f"{i:02d}. {name}  "
+            f"{fmt(prev_val)} → {fmt(curr)} "
+            f"(Δ {sign}{fmt(delta)})"
+        )
+
+    lines.append("")
+    lines.append("*[TOP 10] 증가율*")
+    for i, (rate, name, col_idx, prev_val, curr, delta) in enumerate(top_rates, start=1):
+        sign = "+" if delta >= 0 else ""
+        lines.append(
+            f"{i:02d}. {name}  "
+            f"{fmt(prev_val)} → {fmt(curr)} "
+            f"(Δ {sign}{fmt(delta)}, {rate * 100:.2f}%)"
+        )
+
+    slack_message = "\n".join(lines)
+    send_to_slack(slack_message)
 
 
 if __name__ == "__main__":
