@@ -39,6 +39,10 @@ USER_AGENT = (
 SLEEP_BETWEEN = 1.0     # ✅ URL 1개마다 1초 지연
 DATE_FORMAT = "%Y-%m-%d"
 
+# 재시도 설정
+RETRY_DELAY = 2.0        # 실패 시 재시도 간격(초)
+MAX_RETRY_TIME = 120.0   # 한 채널당 최대 대기 시간(초)
+
 
 def normalize_korean_number(text: str) -> Optional[int]:
     text = (text or "").strip().replace(",", "")
@@ -157,6 +161,33 @@ def get_friend_count_playwright(page, kakao_id: str) -> Optional[int]:
     html = page.content()
     return extract_friend_count_from_html(html)
 
+import time
+
+def get_friend_count_with_retry(page, kakao_id: str) -> int:
+    """
+    친구수를 정상적으로 가져올 때까지 재시도.
+    MAX_RETRY_TIME 초가 지나면 예외 발생.
+    """
+    start_time = time.time()
+    attempt = 0
+
+    while True:
+        attempt += 1
+        cnt = get_friend_count_playwright(page, kakao_id)
+
+        if cnt is not None:
+            return cnt  # ✅ 성공
+
+        elapsed = time.time() - start_time
+        print(f"[RETRY] {kakao_id} attempt {attempt} 실패, {RETRY_DELAY}s 후 재시도")
+
+        if elapsed >= MAX_RETRY_TIME:
+            raise TimeoutError(
+                f"{kakao_id} 친구수 조회 실패: {MAX_RETRY_TIME}s 초과"
+            )
+
+        time.sleep(RETRY_DELAY)
+
 
 def safe_int(cell_value) -> Optional[int]:
     if cell_value is None:
@@ -208,7 +239,7 @@ def main():
 
         for col_idx, kakao_id in targets:
             try:
-                cnt = get_friend_count_playwright(page, kakao_id)
+                cnt = get_friend_count_with_retry(page, kakao_id)
                 print(f"- {name_map[col_idx]} / {kakao_id} -> {cnt}")
 
                 if cnt is not None:
@@ -279,23 +310,23 @@ def main():
     lines.append(f"*📈 카카오 채널 친구수 증가 리포트* ({today_str})")
     lines.append("")
 
-    lines.append("*[TOP 10] 증가량*")
+    lines.append("*✅TOP 10 증가량*")
     for i, (delta, name, col_idx, prev_val, curr) in enumerate(top_deltas, start=1):
         sign = "+" if delta >= 0 else ""
         lines.append(
-            f"{i:02d}. {name}  "
-            f"{fmt(prev_val)} → {fmt(curr)} "
-            f"(Δ {sign}{fmt(delta)})"
+            f"{i}. {name} / "
+            f"{fmt(prev_val)} → {fmt(curr)} / "
+            f"Δ {sign}{fmt(delta)}"
         )
 
     lines.append("")
-    lines.append("*[TOP 10] 증가율*")
+    lines.append("*✅TOP 10 증가율*")
     for i, (rate, name, col_idx, prev_val, curr, delta) in enumerate(top_rates, start=1):
         sign = "+" if delta >= 0 else ""
         lines.append(
-            f"{i:02d}. {name}  "
-            f"{fmt(prev_val)} → {fmt(curr)} "
-            f"(Δ {sign}{fmt(delta)}, {rate * 100:.2f}%)"
+            f"{i}. {name} / "
+            f"{fmt(prev_val)} → {fmt(curr)} / "
+            f"Δ {sign}{fmt(delta)} / {rate * 100:.2f}%"
         )
 
     slack_message = "\n".join(lines)
