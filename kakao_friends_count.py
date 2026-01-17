@@ -310,21 +310,21 @@ def main():
     lines.append(f"*📈 카카오 채널 친구수 증가 리포트* ({today_str})")
     lines.append("")
 
-    lines.append("*✅TOP 10 증가량*")
+    lines.append("*✅ TOP 10 증가량*")
     for i, (delta, name, col_idx, prev_val, curr) in enumerate(top_deltas, start=1):
         sign = "+" if delta >= 0 else ""
         lines.append(
-            f"{i}. {name} / "
+            f"*{i}. {name}* / "
             f"{fmt(prev_val)} → {fmt(curr)} / "
             f"Δ {sign}{fmt(delta)}"
         )
 
     lines.append("")
-    lines.append("*✅TOP 10 증가율*")
+    lines.append("*✅ TOP 10 증가율*")
     for i, (rate, name, col_idx, prev_val, curr, delta) in enumerate(top_rates, start=1):
         sign = "+" if delta >= 0 else ""
         lines.append(
-            f"{i}. {name} / "
+            f"*{i}. {name}* / "
             f"{fmt(prev_val)} → {fmt(curr)} / "
             f"Δ {sign}{fmt(delta)} / {rate * 100:.2f}%"
         )
