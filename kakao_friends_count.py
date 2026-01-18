@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
 from dotenv import load_dotenv
-
 load_dotenv()
 
 # =======================
@@ -23,7 +22,7 @@ SERVICE_ACCOUNT_JSON = "service_account.json"
 GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/1J0muYgf29eqIMDe1BmYKTtS5-tP1KcV2M5ojv1WRHNw/edit?gid=0#gid=0"
 WORKSHEET_NAME = "시트1"
 
-NAME_ROW = 1            # 1행: 이름(브랜드명/채널명)
+NAME_ROW = 1            # 1행: 이름(브랜드명/채널명) - 짝수열에 이름이 있다고 가정
 HEADER_ROW = 2          # 2행: 카카오 채널 ID (짝수열만)
 DATA_START_ROW = 3      # A3부터 날짜/데이터
 DATE_COL = 1            # A열: 날짜
@@ -46,6 +45,9 @@ TOP_N = 5
 DELTA_CHANGE_THRESHOLD = 0.30  # 30%
 
 
+# =======================
+# ✅ 유틸
+# =======================
 def normalize_korean_number(text: str) -> Optional[int]:
     text = (text or "").strip().replace(",", "")
     m = re.search(r"(\d+(?:\.\d+)?)\s*만", text)
@@ -59,10 +61,48 @@ def fmt(n: int) -> str:
     return f"{n:,}"
 
 
-def fmt_pct(x: float) -> str:
-    return f"{x * 100:.2f}%"
+def safe_int(cell_value) -> Optional[int]:
+    if cell_value is None:
+        return None
+    s = str(cell_value).strip().replace(",", "")
+    if s == "":
+        return None
+    try:
+        return int(float(s))
+    except:
+        return None
 
 
+def row_values_1based(ws, row: int) -> List[Optional[str]]:
+    """
+    ws.row_values(row)는 값이 있는 데까지만 오므로,
+    1-based 인덱스(A=1)에 안전하게 접근할 수 있게 앞에 더미를 붙인다.
+    """
+    vals = ws.row_values(row)
+    return [None] + vals
+
+
+def get_cell_from_row(row_1based: List[Optional[str]], col: int) -> Optional[str]:
+    if col < len(row_1based):
+        return row_1based[col]
+    return None
+
+
+def delta_change_ratio(prev_delta: int, today_delta: int) -> float:
+    """
+    전날 증감량 대비 오늘 증감량 변화율(절대 기준)
+    prev_delta == 0:
+      - today_delta == 0 -> 0
+      - today_delta != 0 -> inf
+    """
+    if prev_delta == 0:
+        return float("inf") if today_delta != 0 else 0.0
+    return abs(today_delta - prev_delta) / abs(prev_delta)
+
+
+# =======================
+# ✅ Slack
+# =======================
 def send_to_slack(message: str):
     webhook_url = os.getenv("SLACK_WEBHOOK_URL")
     if not webhook_url:
@@ -84,6 +124,9 @@ def send_to_slack(message: str):
         print(f"[WARN] Slack 전송 중 예외 발생: {e}")
 
 
+# =======================
+# ✅ 크롤링
+# =======================
 def extract_friend_count_from_html(html: str) -> Optional[int]:
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
@@ -96,53 +139,6 @@ def extract_friend_count_from_html(html: str) -> Optional[int]:
         m = re.search(p, text)
         if m:
             return normalize_korean_number(m.group(1))
-    return None
-
-
-def connect_sheet():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_JSON, scopes=scopes)
-    gc = gspread.authorize(creds)
-
-    sh = gc.open_by_url(GOOGLE_SHEET_URL)
-    ws = sh.worksheet(WORKSHEET_NAME)
-    return ws
-
-
-def get_header_ids_even_cols(ws) -> List[Tuple[int, str]]:
-    """
-    2행에서 '짝수열(B,D,F,...)' 중 값이 있는 칸만 대상으로 반환
-    (col_index, kakao_id)
-    """
-    row_vals = ws.row_values(HEADER_ROW)
-    results: List[Tuple[int, str]] = []
-
-    for col_idx, val in enumerate(row_vals, start=1):
-        if col_idx % 2 != 0:   # 짝수열만
-            continue
-        v = (val or "").strip()
-        if not v:
-            continue
-        results.append((col_idx, v))
-    return results
-
-
-def find_next_empty_row_in_col_a(ws) -> int:
-    r = DATA_START_ROW
-    while True:
-        v = ws.cell(r, DATE_COL).value
-        if v is None or str(v).strip() == "":
-            return r
-        r += 1
-
-
-def find_previous_filled_row(ws, current_row: int) -> Optional[int]:
-    r = current_row - 1
-    while r >= DATA_START_ROW:
-        v = ws.cell(r, DATE_COL).value
-        if v is not None and str(v).strip() != "":
-            return r
-        r -= 1
     return None
 
 
@@ -160,7 +156,6 @@ def get_friend_count_with_retry(page, kakao_id: str) -> int:
     while True:
         attempt += 1
         cnt = get_friend_count_playwright(page, kakao_id)
-
         if cnt is not None:
             return cnt
 
@@ -173,119 +168,159 @@ def get_friend_count_with_retry(page, kakao_id: str) -> int:
         time.sleep(RETRY_DELAY)
 
 
-def safe_int(cell_value) -> Optional[int]:
-    if cell_value is None:
-        return None
-    s = str(cell_value).strip().replace(",", "")
-    if s == "":
-        return None
-    try:
-        return int(float(s))
-    except:
-        return None
+# =======================
+# ✅ Sheets
+# =======================
+def connect_sheet():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_JSON, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_url(GOOGLE_SHEET_URL)
+    return sh.worksheet(WORKSHEET_NAME)
 
 
-def delta_change_ratio(prev_delta: int, today_delta: int) -> float:
+def get_targets_from_header(ws) -> List[Tuple[int, str]]:
     """
-    전날 증감량 대비 오늘 증감량 변화율
-    - prev_delta가 0이면:
-        - today_delta도 0 => 0
-        - today_delta != 0 => inf로 취급
+    2행에서 짝수열(B,D,F,...)에 있는 카카오 ID만 타겟
+    반환: [(friend_col, kakao_id), ...]
     """
-    if prev_delta == 0:
-        return float("inf") if today_delta != 0 else 0.0
-    return abs(today_delta - prev_delta) / abs(prev_delta)
+    header = row_values_1based(ws, HEADER_ROW)
+    results: List[Tuple[int, str]] = []
+
+    # col=2부터 짝수만
+    for col in range(2, len(header), 2):
+        v = (header[col] or "").strip()
+        if v:
+            results.append((col, v))
+    return results
 
 
+def find_next_empty_row_and_prev_row(ws) -> Tuple[int, Optional[int]]:
+    """
+    A열(날짜) 기준으로 다음 빈 행 + 바로 이전(마지막 기록) 행을 계산.
+    읽기 요청 최소화를 위해 col_values 1회만 사용.
+    """
+    colA = ws.col_values(DATE_COL)  # 값이 있는 만큼만 옴
+    # colA는 1행부터 시작. DATA_START_ROW부터 검사.
+    # 중간에 빈칸이 없다는 전제(로그 기록형)에서 가장 안정적이고 빠름.
+
+    # 현재 입력된 마지막 행 번호:
+    last_filled_row = len(colA)
+
+    # DATA_START_ROW 이전만 있고 데이터가 없으면
+    if last_filled_row < DATA_START_ROW:
+        target_row = DATA_START_ROW
+        prev_row = None
+        return target_row, prev_row
+
+    # A열이 연속으로 채워지는 구조면,
+    # 다음 빈 행은 last_filled_row + 1
+    target_row = last_filled_row + 1
+
+    # prev_row는 last_filled_row가 DATA_START_ROW 이상일 때
+    prev_row = last_filled_row if last_filled_row >= DATA_START_ROW else None
+    return target_row, prev_row
+
+
+# =======================
+# ✅ main
+# =======================
 def main():
     ws = connect_sheet()
 
-    targets = get_header_ids_even_cols(ws)
+    # ✅ 필요한 행을 한 번에 읽어 쿼터 절약
+    name_row = row_values_1based(ws, NAME_ROW)
+
+    targets = get_targets_from_header(ws)
     if not targets:
         raise RuntimeError("2행(HEADER_ROW) 짝수열에 트래킹할 ID가 없습니다. (B2, D2, F2...)")
 
-    target_row = find_next_empty_row_in_col_a(ws)
+    target_row, prev_row = find_next_empty_row_and_prev_row(ws)
     today_str = datetime.now().strftime(DATE_FORMAT)
-    prev_row = find_previous_filled_row(ws, target_row)
 
     print(f"[INFO] 기록 행: {target_row}, 날짜: {today_str}")
     print(f"[INFO] 이전 비교 행: {prev_row if prev_row else '없음(첫 기록)'}")
     print(f"[INFO] 대상 수: {len(targets)}")
 
-    # 1행 이름 맵
+    # ✅ 이름 맵(짝수열 기준)
     name_map: Dict[int, str] = {}
-    for col_idx, _ in targets:
-        nm = ws.cell(NAME_ROW, col_idx).value
+    for friend_col, _ in targets:
+        nm = get_cell_from_row(name_row, friend_col)
         nm = (nm or "").strip()
-        name_map[col_idx] = nm if nm else f"(col {col_idx})"
+        name_map[friend_col] = nm if nm else f"(col {friend_col})"
 
+    # ✅ prev_row 값은 한 번만 읽기 (429 방지 핵심)
+    prev_row_vals = row_values_1based(ws, prev_row) if prev_row else [None]
+
+    # 1) Playwright로 친구수 수집
     current_counts: Dict[int, int] = {}
-    updates: List[gspread.Cell] = []
-    updates.append(gspread.Cell(target_row, DATE_COL, today_str))
+    base_updates: List[gspread.Cell] = [gspread.Cell(target_row, DATE_COL, today_str)]
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(user_agent=USER_AGENT)
 
-        for col_idx, kakao_id in targets:
+        for friend_col, kakao_id in targets:
             try:
                 cnt = get_friend_count_with_retry(page, kakao_id)
-                print(f"- {name_map[col_idx]} / {kakao_id} -> {cnt}")
-
-                current_counts[col_idx] = cnt
-                updates.append(gspread.Cell(target_row, col_idx, cnt))
-
+                print(f"- {name_map[friend_col]} / {kakao_id} -> {cnt}")
+                current_counts[friend_col] = cnt
+                base_updates.append(gspread.Cell(target_row, friend_col, cnt))
                 time.sleep(SLEEP_BETWEEN)
-
             except Exception as e:
-                print(f"[ERROR] {name_map[col_idx]} / {kakao_id} (col {col_idx}): {e}")
+                print(f"[ERROR] {name_map[friend_col]} / {kakao_id} (col {friend_col}): {e}")
 
         browser.close()
 
-    # ✅ 먼저 친구수 + 날짜 기록
-    ws.update_cells(updates, value_input_option="USER_ENTERED")
-    print(f"[INFO] 저장 완료: 날짜 1개 + 친구수 {len(updates)-1}개")
+    # ✅ 날짜 + 친구수 기록(한 번에)
+    ws.update_cells(base_updates, value_input_option="USER_ENTERED")
+    print(f"[INFO] 저장 완료: 날짜 1개 + 친구수 {len(base_updates)-1}개")
 
-    # =========================
-    # ✅ 증가량/증가율 TOP 5 출력 (+ Slack)
-    # =========================
-    if prev_row is None:
-        print("[RANK] 이전 행이 없어 증가량/증가율 계산을 건너뜁니다.")
+    # 이전 행 없으면 여기서 종료
+    if not prev_row:
+        print("[RANK] 이전 행이 없어 증가량/증가율/증감량 변화 계산을 건너뜁니다.")
         return
 
-    deltas = []   # (delta, name, col_idx, prev, curr)
-    rates = []    # (rate, name, col_idx, prev, curr, delta)
-
-    # ✅ (추가) 홀수열(왼쪽 짝수열의 증감량)도 오늘 값 기록해두기
-    #     - col_idx(짝수열)의 증감량은 (col_idx-1) 홀수열에 기록
+    # 2) 증가량/증가율 계산 + 증감량을 (friend_col+1) 홀수열에 기록
+    deltas = []  # (delta, name, friend_col, prev_friend, curr_friend)
+    rates = []   # (rate, name, friend_col, prev_friend, curr_friend, delta)
     delta_updates: List[gspread.Cell] = []
 
-    for col_idx, _kakao_id in targets:
-        curr = current_counts.get(col_idx)
+    # 3) 증감량 변화 30% 이상 탐지용
+    delta_change_hits = []  # (ratio, name, prev_delta, today_delta)
+
+    for friend_col, _kakao_id in targets:
+        curr = current_counts.get(friend_col)
         if curr is None:
             continue
 
-        prev_val = safe_int(ws.cell(prev_row, col_idx).value)
-        if prev_val is None:
+        prev_friend = safe_int(get_cell_from_row(prev_row_vals, friend_col))
+        if prev_friend is None:
             continue
 
-        delta = curr - prev_val
+        delta = curr - prev_friend
+        name = name_map[friend_col]
 
-        deltas.append((delta, name_map[col_idx], col_idx, prev_val, curr))
+        deltas.append((delta, name, friend_col, prev_friend, curr))
+        if prev_friend > 0:
+            rates.append((delta / prev_friend, name, friend_col, prev_friend, curr, delta))
 
-        if prev_val > 0:
-            rate = delta / prev_val
-            rates.append((rate, name_map[col_idx], col_idx, prev_val, curr, delta))
+        # ✅ 증감량 열 규칙: "친구수 열 + 1" (2열 -> 3열, 4열 -> 5열 ...)
+        delta_col = friend_col + 1
+        delta_updates.append(gspread.Cell(target_row, delta_col, delta))
 
-        # 홀수열(증감량) 기록 (A열 제외, col_idx는 짝수라 col_idx-1은 홀수)
-        delta_col = col_idx - 1
-        if delta_col > 1:  # A열(1) 제외
-            delta_updates.append(gspread.Cell(target_row, delta_col, delta))
+        # ✅ 전날 증감량은 prev_row의 delta_col에서 읽음(행 1번 읽어둔 값에서 꺼냄)
+        prev_delta = safe_int(get_cell_from_row(prev_row_vals, delta_col))
+        if prev_delta is not None:
+            ratio = delta_change_ratio(prev_delta, delta)
+            if ratio >= DELTA_CHANGE_THRESHOLD:
+                delta_change_hits.append((ratio, name, prev_delta, delta))
 
-    # 홀수열 증감량 기록 반영
+    # ✅ 오늘 증감량 기록(한 번에)
     if delta_updates:
         ws.update_cells(delta_updates, value_input_option="USER_ENTERED")
 
+    # TOP 5
     deltas.sort(key=lambda x: x[0], reverse=True)
     rates.sort(key=lambda x: x[0], reverse=True)
 
@@ -293,88 +328,60 @@ def main():
     top_rates = rates[:TOP_N]
 
     print(f"\n========== [TOP {TOP_N}] 증가량(Δ) ==========")
-    for i, (delta, name, _col_idx, prev_val, curr) in enumerate(top_deltas, start=1):
+    for i, (delta, name, _friend_col, prev_friend, curr) in enumerate(top_deltas, start=1):
         sign = "+" if delta >= 0 else ""
-        print(f"{i:02d}. {name}  {fmt(prev_val)} → {fmt(curr)}  (Δ {sign}{fmt(delta)})")
+        print(f"{i:02d}. {name}  {fmt(prev_friend)} → {fmt(curr)}  (Δ {sign}{fmt(delta)})")
 
     print(f"\n========== [TOP {TOP_N}] 증가율(Δ/이전) ==========")
-    for i, (rate, name, _col_idx, prev_val, curr, delta) in enumerate(top_rates, start=1):
+    for i, (rate, name, _friend_col, prev_friend, curr, delta) in enumerate(top_rates, start=1):
         sign = "+" if delta >= 0 else ""
-        print(f"{i:02d}. {name}  {fmt(prev_val)} → {fmt(curr)}  (Δ {sign}{fmt(delta)}, {rate*100:.2f}%)")
+        print(f"{i:02d}. {name}  {fmt(prev_friend)} → {fmt(curr)}  (Δ {sign}{fmt(delta)}, {rate*100:.2f}%)")
 
-    # =========================
-    # ✅ (추가 요구) "증감량 변화 30% 이상" 브랜드 출력
-    # - 홀수열(증감량 컬럼): 전날 vs 오늘 비교
-    # =========================
-    delta_change_hits = []  # (ratio, name, prev_delta, today_delta)
+    # 증감량 변화 30% 이상 (ratio 큰 순, inf 최상단)
+    def sort_key(x):
+        return 10**18 if x[0] == float("inf") else x[0]
 
-    for col_idx, _kakao_id in targets:
-        delta_col = col_idx - 1
-        if delta_col <= 1:  # A열 제외
-            continue
-
-        prev_delta = safe_int(ws.cell(prev_row, delta_col).value)
-        today_delta = safe_int(ws.cell(target_row, delta_col).value)
-
-        # 혹시 오늘 증감량 셀이 아직 비었으면(수식/지연 등), 우리가 계산한 걸로 대체
-        if today_delta is None:
-            curr = current_counts.get(col_idx)
-            prev_val = safe_int(ws.cell(prev_row, col_idx).value)
-            if curr is not None and prev_val is not None:
-                today_delta = curr - prev_val
-
-        if prev_delta is None or today_delta is None:
-            continue
-
-        ratio = delta_change_ratio(prev_delta, today_delta)
-        if ratio >= DELTA_CHANGE_THRESHOLD:
-            delta_change_hits.append((ratio, name_map[col_idx], prev_delta, today_delta))
-
-    # 보기 좋게: 변화율 큰 순서로 정렬
-    delta_change_hits.sort(key=lambda x: (float("inf") if x[0] == float("inf") else x[0]), reverse=True)
+    delta_change_hits.sort(key=sort_key, reverse=True)
 
     if delta_change_hits:
         print(f"\n========== [ALERT] 증감량 변화 {int(DELTA_CHANGE_THRESHOLD*100)}% 이상 ==========")
         for ratio, name, prev_d, today_d in delta_change_hits:
             ratio_text = "∞" if ratio == float("inf") else f"{ratio*100:.2f}%"
-            sign_prev = "+" if prev_d >= 0 else ""
-            sign_today = "+" if today_d >= 0 else ""
-            print(f"- {name}  (전날 Δ {sign_prev}{fmt(prev_d)} → 오늘 Δ {sign_today}{fmt(today_d)} / 변화 {ratio_text})")
+            sp = "+" if prev_d >= 0 else ""
+            st = "+" if today_d >= 0 else ""
+            print(f"- {name}  (전날 Δ {sp}{fmt(prev_d)} → 오늘 Δ {st}{fmt(today_d)} / 변화 {ratio_text})")
     else:
         print(f"\n========== [ALERT] 증감량 변화 {int(DELTA_CHANGE_THRESHOLD*100)}% 이상 없음 ==========")
 
-    # =========================
-    # ✅ Slack 메시지 만들기
-    # =========================
+    # Slack 메시지
     lines = []
     lines.append(f"*📈 카카오 채널 친구수 리포트* ({today_str})")
     lines.append("")
 
     lines.append(f"*✅ TOP {TOP_N} 증가량*")
-    for i, (delta, name, _col_idx, prev_val, curr) in enumerate(top_deltas, start=1):
+    for i, (delta, name, _friend_col, prev_friend, curr) in enumerate(top_deltas, start=1):
         sign = "+" if delta >= 0 else ""
-        lines.append(f"*{i}. {name}* / {fmt(prev_val)} → {fmt(curr)} / Δ {sign}{fmt(delta)}")
+        lines.append(f"*{i}. {name}* / {fmt(prev_friend)} → {fmt(curr)} / Δ {sign}{fmt(delta)}")
 
     lines.append("")
     lines.append(f"*✅ TOP {TOP_N} 증가율*")
-    for i, (rate, name, _col_idx, prev_val, curr, delta) in enumerate(top_rates, start=1):
+    for i, (rate, name, _friend_col, prev_friend, curr, delta) in enumerate(top_rates, start=1):
         sign = "+" if delta >= 0 else ""
-        lines.append(f"*{i}. {name}* / {fmt(prev_val)} → {fmt(curr)} / Δ {sign}{fmt(delta)} / {rate*100:.2f}%")
+        lines.append(f"*{i}. {name}* / {fmt(prev_friend)} → {fmt(curr)} / Δ {sign}{fmt(delta)} / {rate*100:.2f}%")
 
     lines.append("")
     lines.append(f"*🚨 증감량 변화 {int(DELTA_CHANGE_THRESHOLD*100)}% 이상*")
     if delta_change_hits:
         for ratio, name, prev_d, today_d in delta_change_hits:
             ratio_text = "∞" if ratio == float("inf") else f"{ratio*100:.2f}%"
-            sign_prev = "+" if prev_d >= 0 else ""
-            sign_today = "+" if today_d >= 0 else ""
-            lines.append(f"- *{name}* / 전날 Δ {sign_prev}{fmt(prev_d)} → 오늘 Δ {sign_today}{fmt(today_d)} (변화 {ratio_text})")
+            sp = "+" if prev_d >= 0 else ""
+            st = "+" if today_d >= 0 else ""
+            lines.append(f"- *{name}* / 전날 Δ {sp}{fmt(prev_d)} → 오늘 Δ {st}{fmt(today_d)} (변화 {ratio_text})")
     else:
         lines.append("- 해당 없음")
 
     send_to_slack("\n".join(lines))
-
-    print("\n[RANK] 출력 및 Slack 전송 완료")
+    print("\n[INFO] 출력 및 Slack 전송 완료")
 
 
 if __name__ == "__main__":
