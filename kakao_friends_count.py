@@ -41,7 +41,7 @@ RETRY_DELAY = 2.0        # 실패 시 재시도 간격(초)
 MAX_RETRY_TIME = 120.0   # 한 채널당 최대 대기 시간(초)
 
 # 랭킹/알림 설정
-TOP_N = 5
+TOP_N = 8
 DELTA_CHANGE_THRESHOLD = 0.30  # 30%
 
 
